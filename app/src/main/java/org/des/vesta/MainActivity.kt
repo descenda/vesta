@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.GenericShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -30,6 +31,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -45,7 +47,27 @@ import org.des.vesta.ui.theme.VestaTheme
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.*
+import kotlin.math.*
 import kotlin.random.Random
+
+// Optimized Nine-sided scalloped shape
+val NineSidedShape = GenericShape { size, _ ->
+    val centerX = size.width / 2f
+    val centerY = size.height / 2f
+    val radius = size.width.coerceAtMost(size.height) / 2f
+    val sides = 9
+    val amplitude = radius * 0.05f // Smaller amplitude as requested
+    
+    val steps = 72 // Reduced steps for better performance
+    for (i in 0 until steps) {
+        val angle = 2.0 * PI * i / steps
+        val r = radius - amplitude + amplitude * cos(sides * angle).toFloat()
+        val x = centerX + (r * cos(angle)).toFloat()
+        val y = centerY + (r * sin(angle)).toFloat()
+        if (i == 0) moveTo(x, y) else lineTo(x, y)
+    }
+    close()
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -247,7 +269,7 @@ fun ChatView(chatId: String, viewModel: MessengerViewModel) {
                 modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp),
                 reverseLayout = false
             ) {
-                items(messages) { msg ->
+                items(messages, key = { it.id }) { msg ->
                     MessageBubble(msg, msg.senderId == myId)
                 }
             }
@@ -282,11 +304,11 @@ fun ChatView(chatId: String, viewModel: MessengerViewModel) {
                             messageText = ""
                         }
                     },
-                    modifier = Modifier.size(48.dp),
-                    shape = CircleShape,
-                    containerColor = MaterialTheme.colorScheme.primary
+                    modifier = Modifier.size(52.dp),
+                    shape = NineSidedShape,
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
                 ) {
-                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send", tint = Color.White)
+                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
                 }
             }
         }
@@ -298,25 +320,31 @@ fun StarryBackground() {
     val starColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f)
     val planetColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
     
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val random = Random(42)
-        repeat(100) {
-            drawCircle(
-                color = starColor,
-                radius = 1.dp.toPx(),
-                center = Offset(
-                    x = random.nextFloat() * size.width,
-                    y = random.nextFloat() * size.height
-                )
-            )
-        }
-        
-        drawCircle(
-            color = planetColor,
-            radius = size.width,
-            center = Offset(size.width / 2, size.height + size.width * 0.4f)
-        )
-    }
+    Spacer(
+        modifier = Modifier
+            .fillMaxSize()
+            .drawWithCache {
+                onDrawBehind {
+                    val random = Random(42)
+                    repeat(100) {
+                        drawCircle(
+                            color = starColor,
+                            radius = 1.dp.toPx(),
+                            center = Offset(
+                                x = random.nextFloat() * size.width,
+                                y = random.nextFloat() * size.height
+                            )
+                        )
+                    }
+                    
+                    drawCircle(
+                        color = planetColor,
+                        radius = size.width,
+                        center = Offset(size.width / 2, size.height + size.width * 0.4f)
+                    )
+                }
+            }
+    )
 }
 
 @Composable
@@ -341,11 +369,18 @@ fun MessageBubble(msg: Message, isMe: Boolean) {
             }
             
             if (msg.msgType == "image") {
-                val imageBytes = Base64.decode(msg.content, Base64.DEFAULT)
-                val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+                val bitmap = remember(msg.content) {
+                    try {
+                        val imageBytes = Base64.decode(msg.content, Base64.DEFAULT)
+                        BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)?.asImageBitmap()
+                    } catch (e: Exception) {
+                        null
+                    }
+                }
+                
                 if (bitmap != null) {
                     Image(
-                        bitmap = bitmap.asImageBitmap(),
+                        bitmap = bitmap,
                         contentDescription = null,
                         modifier = Modifier
                             .fillMaxWidth()
