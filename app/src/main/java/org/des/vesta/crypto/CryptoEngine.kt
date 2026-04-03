@@ -148,7 +148,7 @@ class CryptoEngine {
         val token = Base64.decode(tokenB64, Base64.URL_SAFE)
         if (token[0] != 0x80.toByte()) throw Exception("Invalid version")
 
-        val hmacReceived = tokwen.copyOfRange(token.size - 32, token.size)
+        val hmacReceived = token.copyOfRange(token.size - 32, token.size)
         val dataToVerify = token.copyOfRange(0, token.size - 32)
 
         val mac = Mac.getInstance("HmacSHA256")
