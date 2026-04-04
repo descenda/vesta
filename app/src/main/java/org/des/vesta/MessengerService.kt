@@ -11,11 +11,11 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import org.des.vesta.data.AppDatabase
-import org.des.vesta.data.Chat
-import org.des.vesta.crypto.CryptoEngine
+import org.des.vesta.data.Message
 import org.des.vesta.network.MessengerClient
 import org.des.vesta.network.Packet
 import kotlinx.serialization.json.*
+import org.des.vesta.crypto.CryptoEngine
 
 class MessengerService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -27,9 +27,11 @@ class MessengerService : Service() {
     private val NOTIF_CHANNEL_ID = "messenger_service"
     private val MSG_CHANNEL_ID = "new_messages"
 
+    // Persistent registration info to re-apply on reconnect
     private var regId: String? = null
     private var regName: String? = null
     private var regPubKey: String? = null
+    private var regAvatar: String? = null
 
     companion object {
         private val _incomingPackets = MutableSharedFlow<Packet>()
@@ -55,9 +57,17 @@ class MessengerService : Service() {
         client.connect()
         
         serviceScope.launch {
+            // Re-register every time the socket connects
             client.onConnected.collect {
-                regId?.let { id ->
-                    client.sendPacket(Packet(action = "register", id = id, name = regName, pub_key = regPubKey))
+                val id = regId
+                if (id != null) {
+                    client.sendPacket(Packet(
+                        action = "register",
+                        id = id,
+                        name = regName,
+                        avatar = regAvatar,
+                        pub_key = regPubKey
+                    ))
                 }
             }
         }
@@ -145,7 +155,7 @@ class MessengerService : Service() {
     private fun createForegroundNotification(): Notification {
         return NotificationCompat.Builder(this, NOTIF_CHANNEL_ID)
             .setContentTitle("Vesta is active")
-            .setContentText("Listening for secure messages...")
+            .setContentText("Listening for incoming secure messages...")
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_MIN)
@@ -154,16 +164,28 @@ class MessengerService : Service() {
 
     suspend fun sendPacket(packet: Packet) = client.sendPacket(packet)
 
-    fun register(id: String, name: String, pubKey: String) {
-        regId = id; regName = name; regPubKey = pubKey
+    fun register(id: String, name: String, pubKey: String, avatar: String?) {
+        regId = id
+        regName = name
+        regPubKey = pubKey
+        regAvatar = avatar
         serviceScope.launch {
             val privPem = db.messengerDao().getSetting("private_key_pem")
             if (privPem != null) crypto = CryptoEngine(privPem, pubKey)
-            client.sendPacket(Packet(action = "register", id = id, name = name, pub_key = pubKey))
+            client.sendPacket(Packet(
+                action = "register",
+                id = id,
+                name = name,
+                avatar = avatar,
+                pub_key = pubKey
+            ))
         }
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        return START_STICKY
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {

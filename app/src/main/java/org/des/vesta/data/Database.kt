@@ -21,7 +21,16 @@ data class Chat(
     val status: String,
     val type: String = "private", // "private" or "group"
     val displayName: String?,
-    val lastMsgTs: String
+    val avatar: String? = null,
+    val bio: String? = null,
+    val lastMsgTs: String,
+    val lastMessage: String? = null,
+    val unreadCount: Int = 0,
+    val draft: String? = null,
+    val isPinned: Boolean = false,
+    val isMuted: Boolean = false,
+    val isArchived: Boolean = false,
+    val isBlocked: Boolean = false
 )
 
 @Entity(tableName = "messages")
@@ -31,9 +40,13 @@ data class Message(
     val contactId: String,
     val senderId: String,
     val senderName: String,
-    val msgType: String, // "text", "image", "voice"
+    val msgType: String, // "text", "image", "voice", "sticker"
     val content: String, // Base64 for media or encrypted text
-    val timestamp: String
+    val timestamp: String,
+    val isRead: Boolean = false,
+    val isStarred: Boolean = false,
+    val replyToId: Int? = null,
+    val metadata: String? = null // JSON for extra info (e.g., image size, voice duration)
 )
 
 @Entity(tableName = "settings")
@@ -44,8 +57,14 @@ data class Setting(
 
 @Dao
 interface MessengerDao {
-    @Query("SELECT * FROM chats ORDER BY lastMsgTs DESC")
+    @Query("SELECT * FROM chats WHERE isArchived = 0 AND isBlocked = 0 ORDER BY isPinned DESC, lastMsgTs DESC")
     fun getAllChats(): Flow<List<Chat>>
+
+    @Query("SELECT * FROM chats WHERE isArchived = 1 ORDER BY lastMsgTs DESC")
+    fun getArchivedChats(): Flow<List<Chat>>
+
+    @Query("SELECT * FROM chats WHERE isBlocked = 1")
+    fun getBlockedChats(): Flow<List<Chat>>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertChat(chat: Chat)
@@ -53,11 +72,47 @@ interface MessengerDao {
     @Query("SELECT * FROM chats WHERE contactId = :contactId")
     suspend fun getChat(contactId: String): Chat?
 
+    @Query("UPDATE chats SET lastMsgTs = :ts, lastMessage = :text, unreadCount = unreadCount + :unreadInc WHERE contactId = :contactId")
+    suspend fun updateLastMessage(contactId: String, text: String, ts: String, unreadInc: Int)
+
+    @Query("UPDATE chats SET unreadCount = 0 WHERE contactId = :contactId")
+    suspend fun clearUnreadCount(contactId: String)
+
+    @Query("UPDATE chats SET draft = :draft WHERE contactId = :contactId")
+    suspend fun updateDraft(contactId: String, draft: String?)
+
+    @Query("UPDATE chats SET isPinned = :pinned WHERE contactId = :contactId")
+    suspend fun setChatPinned(contactId: String, pinned: Boolean)
+
+    @Query("UPDATE chats SET isArchived = :archived WHERE contactId = :contactId")
+    suspend fun setChatArchived(contactId: String, archived: Boolean)
+
+    @Query("UPDATE chats SET isBlocked = :blocked WHERE contactId = :contactId")
+    suspend fun setChatBlocked(contactId: String, blocked: Boolean)
+
+    @Query("SELECT SUM(unreadCount) FROM chats")
+    fun getTotalUnreadCount(): Flow<Int?>
+
     @Query("SELECT * FROM messages WHERE contactId = :contactId ORDER BY id ASC")
     fun getMessages(contactId: String): Flow<List<Message>>
 
+    @Query("SELECT * FROM messages WHERE isStarred = 1 AND contactId = :contactId")
+    fun getStarredMessages(contactId: String): Flow<List<Message>>
+
+    @Query("SELECT * FROM messages WHERE content LIKE '%' || :query || '%' AND contactId = :contactId")
+    suspend fun searchMessages(contactId: String, query: String): List<Message>
+
     @Insert
     suspend fun insertMessage(message: Message)
+
+    @Query("UPDATE messages SET isRead = 1 WHERE contactId = :contactId AND isRead = 0")
+    suspend fun markChatAsRead(contactId: String)
+
+    @Query("UPDATE messages SET isStarred = :starred WHERE id = :msgId")
+    suspend fun setMessageStarred(msgId: Int, starred: Boolean)
+
+    @Query("DELETE FROM messages WHERE id = :msgId")
+    suspend fun deleteMessage(msgId: Int)
 
     @Query("DELETE FROM messages WHERE contactId = :contactId")
     suspend fun deleteMessagesForChat(contactId: String)
@@ -72,7 +127,7 @@ interface MessengerDao {
     suspend fun getSetting(key: String): String?
 }
 
-@Database(entities = [Chat::class, Message::class, Setting::class], version = 1, exportSchema = false)
+@Database(entities = [Chat::class, Message::class, Setting::class], version = 3, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun messengerDao(): MessengerDao
 
@@ -86,7 +141,9 @@ abstract class AppDatabase : RoomDatabase() {
                     context.applicationContext,
                     AppDatabase::class.java,
                     "secure_messenger.db"
-                ).build()
+                )
+                .fallbackToDestructiveMigration()
+                .build()
                 INSTANCE = instance
                 instance
             }

@@ -28,6 +28,7 @@ data class Packet(
     val action: String,
     val id: String? = null,
     val name: String? = null,
+    val avatar: String? = null, // Added avatar support
     val pub_key: String? = null,
     val target: String? = null,
     val to: String? = null,

@@ -41,11 +41,17 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
     private val _userName = MutableStateFlow("User")
     val userName: StateFlow<String> = _userName
 
+    private val _userAvatar = MutableStateFlow<String?>(null)
+    val userAvatar: StateFlow<String?> = _userAvatar
+
     private val _isDarkMode = MutableStateFlow(false)
     val isDarkMode: StateFlow<Boolean> = _isDarkMode
 
     private val _showLinkWarning = MutableStateFlow(true)
     val showLinkWarning: StateFlow<Boolean> = _showLinkWarning
+
+    // QoL: Track currently opened chat to handle unread logic
+    private var currentChatId: String? = null
 
     private val incomingChunks = mutableMapOf<String, MutableMap<Int, String>>()
     private val incomingChunksTotal = mutableMapOf<String, Int>()
@@ -62,6 +68,7 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             var id = dao.getSetting("my_id")
             val name = dao.getSetting("user_name") ?: "User"
+            val avatar = dao.getSetting("user_avatar")
             val theme = dao.getSetting("theme") ?: "Light"
             val linkWarn = dao.getSetting("link_warning") ?: "True"
             
@@ -88,10 +95,11 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
             
             _myId.value = id
             _userName.value = name
+            _userAvatar.value = avatar
             _isDarkMode.value = theme == "Dark"
             _showLinkWarning.value = linkWarn == "True"
             
-            MessengerService.instance?.register(_myId.value, _userName.value, crypto.getPublicKeyPem())
+            MessengerService.instance?.register(_myId.value, _userName.value, crypto.getPublicKeyPem(), _userAvatar.value)
         }
     }
 
@@ -102,13 +110,52 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun setChatPinned(contactId: String, pinned: Boolean) {
+        viewModelScope.launch {
+            dao.setChatPinned(contactId, pinned)
+        }
+    }
+
+    fun setCurrentChat(contactId: String?) {
+        currentChatId = contactId
+        if (contactId != null) {
+            clearUnreadCount(contactId)
+        }
+    }
+
+    fun clearUnreadCount(contactId: String) {
+        viewModelScope.launch {
+            dao.clearUnreadCount(contactId)
+            dao.markChatAsRead(contactId)
+        }
+    }
+
+    fun updateDraft(contactId: String, draft: String?) {
+        viewModelScope.launch {
+            dao.updateDraft(contactId, draft)
+        }
+    }
+
     fun updateProfile(newName: String) {
         viewModelScope.launch {
             _userName.value = newName
             dao.setSetting(Setting("user_name", newName))
              MessengerService.instance?.sendPacket(Packet(
                 action = "update_profile",
-                name = newName
+                name = newName,
+                avatar = _userAvatar.value
+            ))
+        }
+    }
+
+    fun updateAvatar(base64: String) {
+        viewModelScope.launch {
+            _userAvatar.value = base64
+            dao.setSetting(Setting("user_avatar", base64))
+            MessengerService.instance?.sendPacket(Packet(
+                action = "update_profile",
+                name = _userName.value,
+                avatar = base64
             ))
         }
     }
@@ -133,8 +180,19 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
                 when (packet.action) {
                     "incoming" -> handleIncomingPacket(packet)
                     "pub_key_response" -> handlePubKeyResponse(packet)
+                    "profile_updated" -> handleProfileUpdated(packet)
                 }
             }
+        }
+    }
+
+    private suspend fun handleProfileUpdated(packet: Packet) {
+        val contactId = packet.id ?: return
+        val name = packet.name
+        val avatar = packet.avatar
+        val chat = dao.getChat(contactId)
+        if (chat != null) {
+            dao.insertChat(chat.copy(displayName = name ?: chat.displayName, avatar = avatar ?: chat.avatar))
         }
     }
 
@@ -163,6 +221,11 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
                         timestamp = System.currentTimeMillis().toString()
                     )
                     dao.insertMessage(msg)
+                    
+                    // QoL Fix: Only increment unread count if user is NOT currently in this chat
+                    val unreadIncrement = if (currentChatId == from) 0 else 1
+                    val preview = if (msgType == "text") decrypted else if (msgType == "image") "Sent a photo" else "Sent a sticker"
+                    dao.updateLastMessage(from, preview, msg.timestamp, unreadIncrement)
                 } catch (e: Exception) {
                     e.printStackTrace()
                 }
@@ -200,6 +263,10 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
                             timestamp = System.currentTimeMillis().toString()
                         )
                         dao.insertMessage(msg)
+                        
+                        val unreadIncrement = if (currentChatId == from) 0 else 1
+                        val preview = if (msgType == "text") decrypted else if (msgType == "image") "Sent a photo" else "Sent a sticker"
+                        dao.updateLastMessage(from, preview, msg.timestamp, unreadIncrement)
                     } catch (e: Exception) {
                         e.printStackTrace()
                     }
@@ -302,6 +369,8 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
                     )) ?: false
                     if (success) {
                         insertLocalMessage(contactId, content, msgType)
+                        val preview = if (msgType == "text") content else "Sent a photo"
+                        dao.updateLastMessage(contactId, preview, System.currentTimeMillis().toString(), 0)
                     }
                 } else {
                     val msgId = UUID.randomUUID().toString()
@@ -331,6 +400,8 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
                     
                     if (allSuccess) {
                         insertLocalMessage(contactId, content, msgType)
+                        val preview = if (msgType == "text") content else "Sent a photo"
+                        dao.updateLastMessage(contactId, preview, System.currentTimeMillis().toString(), 0)
                     }
                 }
             } catch (e: Exception) {
@@ -409,6 +480,7 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
 
                 if (success) {
                     insertLocalMessage(contactId, stickerContent, "sticker")
+                    dao.updateLastMessage(contactId, "Sent a sticker", System.currentTimeMillis().toString(), 0)
                 }
             } catch (e: Exception) { e.printStackTrace() }
         }

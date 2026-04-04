@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Base64
+import android.view.HapticFeedbackConstants
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -50,6 +51,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
@@ -158,7 +160,12 @@ fun MainScreen(viewModel: MessengerViewModel, incomingChatId: String? = null) {
     val isDarkMode by viewModel.isDarkMode.collectAsState()
     val showLinkWarning by viewModel.showLinkWarning.collectAsState()
 
-    LaunchedEffect(incomingChatId) { if (incomingChatId != null) selectedChatId = incomingChatId }
+    LaunchedEffect(incomingChatId) { 
+        if (incomingChatId != null) {
+            selectedChatId = incomingChatId
+            viewModel.setCurrentChat(incomingChatId)
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -171,7 +178,10 @@ fun MainScreen(viewModel: MessengerViewModel, incomingChatId: String? = null) {
                 },
                 navigationIcon = {
                     if (selectedChatId != null) {
-                        IconButton(onClick = { selectedChatId = null }) {
+                        IconButton(onClick = { 
+                            selectedChatId = null 
+                            viewModel.setCurrentChat(null)
+                        }) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                         }
                     }
@@ -198,7 +208,10 @@ fun MainScreen(viewModel: MessengerViewModel, incomingChatId: String? = null) {
                 },
                 label = ""
             ) { targetChatId ->
-                if (targetChatId == null) ChatList(chats, viewModel) { id -> selectedChatId = id }
+                if (targetChatId == null) ChatList(chats, viewModel) { id -> 
+                    selectedChatId = id
+                    viewModel.setCurrentChat(id)
+                }
                 else ChatView(targetChatId, viewModel)
             }
         }
@@ -221,11 +234,29 @@ fun MainScreen(viewModel: MessengerViewModel, incomingChatId: String? = null) {
 
     if (showSettingsDialog) {
         var tempName by remember { mutableStateOf(myName) }
+        val context = LocalContext.current
+        
+        val pfpLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+            uri?.let {
+                val original = BitmapFactory.decodeStream(context.contentResolver.openInputStream(it))
+                val scale = min(1f, 300f / max(original.width, original.height))
+                val bitmap = if (scale < 1f) Bitmap.createScaledBitmap(original, (original.width * scale).toInt(), (original.height * scale).toInt(), true) else original
+                val out = ByteArrayOutputStream(); bitmap.compress(Bitmap.CompressFormat.JPEG, 70, out)
+                viewModel.updateAvatar(Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP))
+            }
+        }
+
         AlertDialog(
             onDismissRequest = { showSettingsDialog = false },
             title = { Text("Settings") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Box(modifier = Modifier.size(100.dp).clickable { pfpLauncher.launch("image/*") }) {
+                        IdenticonAvatar(myId, myName, size = 100.dp)
+                        Box(modifier = Modifier.align(Alignment.BottomEnd).background(MaterialTheme.colorScheme.primary, CircleShape).padding(4.dp)) {
+                            Icon(Icons.Default.Edit, null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onPrimary)
+                        }
+                    }
                     TextField(value = tempName, onValueChange = { tempName = it }, label = { Text("Your Name") }, singleLine = true)
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Text("Dark Mode"); Switch(checked = isDarkMode, onCheckedChange = { viewModel.toggleTheme(it) })
@@ -243,7 +274,8 @@ fun MainScreen(viewModel: MessengerViewModel, incomingChatId: String? = null) {
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ChatList(chats: List<Chat>, viewModel: MessengerViewModel, onChatClick: (String) -> Unit) {
-    var chatToDelete by remember { mutableStateOf<String?>(null) }
+    var chatToManage by remember { mutableStateOf<Chat?>(null) }
+    val view = LocalView.current
 
     if (chats.isEmpty()) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -259,38 +291,120 @@ fun ChatList(chats: List<Chat>, viewModel: MessengerViewModel, onChatClick: (Str
         items(chats, key = { it.contactId }) { chat ->
             Box(modifier = Modifier.animateItem()) {
                 ListItem(
-                    headlineContent = { Text(chat.displayName ?: chat.contactId, fontWeight = FontWeight.Bold) },
-                    supportingContent = { Text(if (chat.status == "active") "Secure Tunnel" else "Pending...", color = if (chat.status == "active") MaterialTheme.colorScheme.primary else Color.Gray) },
-                    leadingContent = { Surface(modifier = Modifier.size(48.dp), shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer) { Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.Person, null) } } },
+                    headlineContent = { 
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(chat.displayName ?: chat.contactId, fontWeight = FontWeight.Bold)
+                            if (chat.isPinned) {
+                                Spacer(Modifier.width(4.dp))
+                                Icon(Icons.Default.PushPin, null, modifier = Modifier.size(12.dp), tint = MaterialTheme.colorScheme.primary)
+                            }
+                        }
+                    },
+                    supportingContent = { 
+                        Text(
+                            chat.lastMessage ?: if (chat.status == "active") "Secure Tunnel" else "Pending...",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            color = if (chat.unreadCount > 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
+                        ) 
+                    },
+                    leadingContent = { 
+                        IdenticonAvatar(chat.contactId, chat.displayName, avatarBase64 = chat.avatar)
+                    },
+                    trailingContent = {
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text(formatTimeShort(chat.lastMsgTs.toLongOrNull() ?: 0L), style = MaterialTheme.typography.labelSmall)
+                            if (chat.unreadCount > 0) {
+                                Badge(containerColor = MaterialTheme.colorScheme.primary) { 
+                                    Text(chat.unreadCount.toString(), color = MaterialTheme.colorScheme.onPrimary) 
+                                }
+                            }
+                        }
+                    },
                     modifier = Modifier.combinedClickable(
                         onClick = { onChatClick(chat.contactId) },
-                        onLongClick = { chatToDelete = chat.contactId }
+                        onLongClick = { 
+                            view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                            chatToManage = chat 
+                        }
                     )
                 )
             }
-            HorizontalDivider()
+            HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp), thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
         }
     }
 
-    if (chatToDelete != null) {
+    if (chatToManage != null) {
         AlertDialog(
-            onDismissRequest = { chatToDelete = null },
-            title = { Text("Delete Chat") },
-            text = { Text("Delete all history with this contact?") },
-            confirmButton = { Button(onClick = { viewModel.deleteChat(chatToDelete!!); chatToDelete = null }) { Text("Delete") } },
-            dismissButton = { TextButton(onClick = { chatToDelete = null }) { Text("Cancel") } }
+            onDismissRequest = { chatToManage = null },
+            title = { Text(chatToManage!!.displayName ?: chatToManage!!.contactId) },
+            text = { Text("Chat Options") },
+            confirmButton = {
+                Column {
+                    TextButton(onClick = { 
+                        viewModel.setChatPinned(chatToManage!!.contactId, !chatToManage!!.isPinned)
+                        chatToManage = null
+                    }) { Text(if (chatToManage!!.isPinned) "Unpin" else "Pin") }
+                    
+                    TextButton(onClick = { 
+                        viewModel.deleteChat(chatToManage!!.contactId)
+                        chatToManage = null
+                    }, colors = ButtonDefaults.textButtonColors(contentColor = Color.Red)) { Text("Delete Chat") }
+                }
+            }
         )
+    }
+}
+
+@Composable
+fun IdenticonAvatar(id: String, name: String?, size: androidx.compose.ui.unit.Dp = 48.dp, avatarBase64: String? = null) {
+    val bitmap = remember(avatarBase64) {
+        if (avatarBase64 != null) {
+            try {
+                val bytes = Base64.decode(avatarBase64, Base64.DEFAULT)
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+            } catch (e: Exception) { null }
+        } else null
+    }
+
+    Surface(modifier = Modifier.size(size), shape = CircleShape, color = MaterialTheme.colorScheme.surfaceVariant) {
+        if (bitmap != null) {
+            Image(bitmap = bitmap, contentDescription = null, contentScale = ContentScale.Crop)
+        } else {
+            val color = remember(id) {
+                val hash = id.hashCode()
+                Color(
+                    red = (hash and 0xFF0000 shr 16) / 255f * 0.4f + 0.3f,
+                    green = (hash and 0x00FF00 shr 8) / 255f * 0.4f + 0.3f,
+                    blue = (hash and 0x0000FF) / 255f * 0.4f + 0.3f,
+                    alpha = 1f
+                )
+            }
+            Box(modifier = Modifier.fillMaxSize().background(color), contentAlignment = Alignment.Center) {
+                Text(
+                    text = (name ?: id).take(1).uppercase(),
+                    color = MaterialTheme.colorScheme.onSurface, // Fallback to onSurface color as requested
+                    fontWeight = FontWeight.ExtraBold,
+                    style = MaterialTheme.typography.titleLarge.copy(fontSize = (size.value * 0.4f).sp)
+                )
+            }
+        }
     }
 }
 
 @Composable
 fun ChatView(chatId: String, viewModel: MessengerViewModel) {
     val messages by viewModel.getMessages(chatId).collectAsState(initial = emptyList())
-    var messageText by remember { mutableStateOf("") }
+    val chat by remember(chatId) { derivedStateOf { viewModel.allChats.value.find { it.contactId == chatId } } }
+    
+    var messageText by remember { mutableStateOf(chat?.draft ?: "") }
     val myId by viewModel.myId.collectAsState()
     val context = LocalContext.current
+    val view = LocalView.current
     val listState = rememberLazyListState()
     var showStickers by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+    var isSearching by remember { mutableStateOf(false) }
 
     val imagePickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         uri?.let {
@@ -309,10 +423,18 @@ fun ChatView(chatId: String, viewModel: MessengerViewModel) {
     LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1) }
 
     Column(modifier = Modifier.fillMaxSize()) {
+        AnimatedVisibility(visible = isSearching) {
+            TextField(value = searchQuery, onValueChange = { searchQuery = it }, modifier = Modifier.fillMaxWidth(), placeholder = { Text("Search messages...") }, trailingIcon = { IconButton(onClick = { isSearching = false; searchQuery = "" }) { Icon(Icons.Default.Close, null) } }, colors = TextFieldDefaults.colors(focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent))
+        }
+
         Box(modifier = Modifier.weight(1f)) {
             StarryBackground()
+            val displayMessages = if (searchQuery.isBlank()) messages else messages.filter { it.content.contains(searchQuery, ignoreCase = true) }
             LazyColumn(state = listState, modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp)) {
-                items(messages, key = { it.id }) { msg -> MessageBubble(msg, msg.senderId == myId, viewModel) }
+                items(displayMessages, key = { it.id }) { msg -> MessageBubble(msg, msg.senderId == myId, viewModel) }
+            }
+            if (!isSearching) {
+                IconButton(onClick = { isSearching = true }, modifier = Modifier.align(Alignment.TopEnd).padding(8.dp)) { Icon(Icons.Default.Search, null, tint = Color.White.copy(0.3f)) }
             }
         }
         
@@ -334,12 +456,12 @@ fun ChatView(chatId: String, viewModel: MessengerViewModel) {
             Row(modifier = Modifier.padding(8.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 IconButton(onClick = { showStickers = !showStickers }) { Icon(if (showStickers) Icons.Default.Close else Icons.Default.StickyNote2, null) }
                 IconButton(onClick = { imagePickerLauncher.launch("image/*") }) { Icon(Icons.Default.Image, null) }
-                IconButton(onClick = { Toast.makeText(context, "Voice recording...", Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.Mic, null) }
-                TextField(value = messageText, onValueChange = { messageText = it }, modifier = Modifier.weight(1f), placeholder = { Text("Message") }, shape = RoundedCornerShape(24.dp), colors = TextFieldDefaults.colors(focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent))
+                IconButton(onClick = { view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY); Toast.makeText(context, "Voice recording...", Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.Mic, null) }
+                TextField(value = messageText, onValueChange = { messageText = it; viewModel.updateDraft(chatId, it) }, modifier = Modifier.weight(1f), placeholder = { Text("Message") }, shape = RoundedCornerShape(24.dp), colors = TextFieldDefaults.colors(focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent))
                 Spacer(Modifier.width(8.dp))
                 val interact = remember { MutableInteractionSource() }; val pressed by interact.collectIsPressedAsState()
                 val scale by animateFloatAsState(if (pressed) 0.85f else 1f, BouncySpring, label = "")
-                FloatingActionButton(onClick = { if (messageText.isNotBlank()) { viewModel.sendMessage(chatId, messageText); messageText = "" } }, modifier = Modifier.size(52.dp).graphicsLayer { scaleX = scale; scaleY = scale }, shape = NineSidedShape, containerColor = MaterialTheme.colorScheme.primaryContainer, interactionSource = interact) { Icon(Icons.AutoMirrored.Filled.Send, null) }
+                FloatingActionButton(onClick = { if (messageText.isNotBlank()) { view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY); viewModel.sendMessage(chatId, messageText); messageText = ""; viewModel.updateDraft(chatId, "") } }, modifier = Modifier.size(52.dp).graphicsLayer { scaleX = scale; scaleY = scale }, shape = NineSidedShape, containerColor = MaterialTheme.colorScheme.primaryContainer, interactionSource = interact) { Icon(Icons.AutoMirrored.Filled.Send, null) }
             }
         }
     }
@@ -385,11 +507,7 @@ fun MessageBubble(msg: Message, isMe: Boolean, viewModel: MessengerViewModel) {
             }
             if (msg.msgType != "sticker") {
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.align(Alignment.End)) {
-                    Text(
-                        text = formatTime(msg.timestamp.toLong()), 
-                        color = textColor.copy(0.6f), 
-                        fontSize = 10.sp
-                    )
+                    Text(text = formatTime(msg.timestamp.toLong()), color = textColor.copy(0.6f), fontSize = 10.sp)
                     if (isMe) {
                         Spacer(Modifier.width(4.dp))
                         Icon(Icons.Default.Done, null, modifier = Modifier.size(12.dp), tint = textColor.copy(0.6f))
@@ -403,6 +521,12 @@ fun MessageBubble(msg: Message, isMe: Boolean, viewModel: MessengerViewModel) {
 
 fun formatTime(timestamp: Long): String {
     val sdf = SimpleDateFormat(if (System.currentTimeMillis() - timestamp < 86400000) "HH:mm" else "MMM dd, HH:mm", Locale.getDefault())
+    return sdf.format(Date(timestamp))
+}
+
+fun formatTimeShort(timestamp: Long): String {
+    if (timestamp == 0L) return ""
+    val sdf = SimpleDateFormat(if (System.currentTimeMillis() - timestamp < 86400000) "HH:mm" else "MMM dd", Locale.getDefault())
     return sdf.format(Date(timestamp))
 }
 
