@@ -1,27 +1,27 @@
 package org.des.vesta.network
-import okhttp3.OkHttpClient
-import java.security.SecureRandom
-import java.security.cert.X509Certificate
-import javax.net.ssl.SSLContext
-import javax.net.ssl.TrustManager
-import javax.net.ssl.X509TrustManager
+
 import io.ktor.client.*
+import io.ktor.client.engine.okhttp.*
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.plugins.websocket.*
-import io.ktor.client.request.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.websocket.*
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import io.ktor.client.engine.okhttp.* // Для OkHttp и preconfigured
+import okhttp3.OkHttpClient
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 @Serializable
 data class Packet(
@@ -42,22 +42,23 @@ class MessengerClient(private val host: String) {
         isLenient = true
     }
 
-    private val client = HttpClient(OkHttp) { // Добавили движок OkHttp
+    private val client = HttpClient(OkHttp) {
         engine {
-            // Подключаем наш "взломщик" проверок SSL
             preconfigured = getUnsafeOkHttpClient()
         }
 
         install(WebSockets) {
             contentConverter = KotlinxWebsocketSerializationConverter(json)
-            // СТРОКУ С maxFrameSize УДАЛИЛИ, чтобы OkHttp не ругался
+            pingIntervalMillis = 20_000
         }
 
         install(ContentNegotiation) {
             json(json)
         }
     }
+
     private var session: DefaultClientWebSocketSession? = null
+    private val sendMutex = Mutex()
 
     private val _incomingPackets = MutableSharedFlow<Packet>()
     val incomingPackets = _incomingPackets.asSharedFlow()
@@ -72,8 +73,10 @@ class MessengerClient(private val host: String) {
 
     fun connect() {
         scope.launch {
+            var retryDelay = 1000L
             while (isActive) {
                 try {
+                    println("WS: Connecting to wss://$host...")
                     client.wss(
                         method = HttpMethod.Get,
                         host = host,
@@ -84,6 +87,8 @@ class MessengerClient(private val host: String) {
                             }
                         }
                     ) {
+                        println("WS: Connected")
+                        retryDelay = 1000L
                         session = this
                         _isConnected.value = true
                         _onConnected.emit(Unit)
@@ -91,16 +96,18 @@ class MessengerClient(private val host: String) {
                         try {
                             for (frame in incoming) {
                                 if (frame is Frame.Text) {
-                                    val text = frame.readText()
                                     try {
-                                        val packet = json.decodeFromString<Packet>(text)
+                                        val packet = json.decodeFromString<Packet>(frame.readText())
                                         _incomingPackets.emit(packet)
                                     } catch (e: Exception) {
                                         println("WS Parse Error: ${e.message}")
                                     }
                                 }
                             }
+                        } catch (e: Exception) {
+                            println("WS Session Error: ${e.message}")
                         } finally {
+                            println("WS: Disconnected")
                             _isConnected.value = false
                             session = null
                         }
@@ -108,30 +115,40 @@ class MessengerClient(private val host: String) {
                 } catch (e: Exception) {
                     println("WS Connection Error: ${e.message}")
                     _isConnected.value = false
-                    delay(5000)
+                    session = null
+                    delay(retryDelay)
+                    retryDelay = (retryDelay * 2).coerceAtMost(30000L)
                 }
             }
         }
     }
 
     suspend fun sendPacket(packet: Packet): Boolean {
-        val currentSession = session
-        return if (currentSession != null && currentSession.isActive) {
-            try {
-                currentSession.sendSerialized(packet)
-                true
-            } catch (e: Exception) {
-                println("WS Send Error: ${e.message}")
-                false
+        val currentSession = session ?: return false
+        if (!currentSession.isActive) return false
+
+        return try {
+            withTimeout(15_000) {
+                sendMutex.withLock {
+                    currentSession.sendSerialized(packet)
+                    true
+                }
             }
-        } else {
+        } catch (e: Exception) {
+            println("WS Send Failure (${packet.action}): ${e.message}")
+            try {
+                currentSession.close(CloseReason(CloseReason.Codes.INTERNAL_ERROR, "Send failure"))
+            } catch (_: Exception) {}
             false
         }
     }
+
+    fun close() {
+        scope.cancel()
+        client.close()
+    }
 }
 
-
-// Эту функцию можно положить прямо в конец твоего Kotlin файла
 fun getUnsafeOkHttpClient(): OkHttpClient {
     val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
         override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
@@ -139,11 +156,15 @@ fun getUnsafeOkHttpClient(): OkHttpClient {
         override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
     })
 
-    val sslContext = SSLContext.getInstance("SSL")
-    sslContext.init(null, trustAllCerts, SecureRandom())
+    val sslContext = SSLContext.getInstance("SSL").apply {
+        init(null, trustAllCerts, SecureRandom())
+    }
 
     return OkHttpClient.Builder()
         .sslSocketFactory(sslContext.socketFactory, trustAllCerts[0] as X509TrustManager)
-        .hostnameVerifier { _, _ -> true } // Вот это лечит ошибку "hostname aware"
+        .hostnameVerifier { _, _ -> true }
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 }

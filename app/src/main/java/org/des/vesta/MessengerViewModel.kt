@@ -1,26 +1,39 @@
 package org.des.vesta
 
+import android.annotation.SuppressLint
 import android.app.Application
-import android.util.Base64
+import android.content.Context
+import android.location.Address
+import android.location.Geocoder
+import android.location.Location
+import android.os.BatteryManager
+import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.Task
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 import org.des.vesta.crypto.CryptoEngine
 import org.des.vesta.data.AppDatabase
 import org.des.vesta.data.Chat
 import org.des.vesta.data.Message
 import org.des.vesta.data.Setting
-import org.des.vesta.network.MessengerClient
 import org.des.vesta.network.Packet
+import java.text.SimpleDateFormat
 import java.util.*
+import kotlin.coroutines.resume
 
 class MessengerViewModel(application: Application) : AndroidViewModel(application) {
     private val db = AppDatabase.getDatabase(application)
     private val dao = db.messengerDao()
     private var crypto = CryptoEngine()
-    private val client = MessengerClient("herringlike-unneedy-benson.ngrok-free.dev")
+    private val fusedLocationClient = LocationServices.getFusedLocationProviderClient(application)
 
     private val _myId = MutableStateFlow("")
     val myId: StateFlow<String> = _myId
@@ -31,21 +44,18 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
     private val _isDarkMode = MutableStateFlow(false)
     val isDarkMode: StateFlow<Boolean> = _isDarkMode
 
+    private val _showLinkWarning = MutableStateFlow(true)
+    val showLinkWarning: StateFlow<Boolean> = _showLinkWarning
+
+    private val incomingChunks = mutableMapOf<String, MutableMap<Int, String>>()
+    private val incomingChunksTotal = mutableMapOf<String, Int>()
+
     val allChats: StateFlow<List<Chat>> = dao.getAllChats()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     init {
         loadIdentity()
-        client.connect()
         observeIncomingPackets()
-        
-        viewModelScope.launch {
-            client.onConnected.collect {
-                if (_myId.value.isNotEmpty()) {
-                    register()
-                }
-            }
-        }
     }
 
     private fun loadIdentity() {
@@ -53,6 +63,7 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
             var id = dao.getSetting("my_id")
             val name = dao.getSetting("user_name") ?: "User"
             val theme = dao.getSetting("theme") ?: "Light"
+            val linkWarn = dao.getSetting("link_warning") ?: "True"
             
             val privPem = dao.getSetting("private_key_pem")
             val pubPem = dao.getSetting("public_key_pem")
@@ -78,21 +89,16 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
             _myId.value = id
             _userName.value = name
             _isDarkMode.value = theme == "Dark"
+            _showLinkWarning.value = linkWarn == "True"
             
-            if (client.isConnected.value) {
-                register()
-            }
+            MessengerService.instance?.register(_myId.value, _userName.value, crypto.getPublicKeyPem())
         }
     }
-// i don't care that i should be uppercase
-    private fun register() {
+
+    fun deleteChat(contactId: String) {
         viewModelScope.launch {
-            client.sendPacket(Packet(
-                action = "register",
-                id = _myId.value,
-                name = _userName.value,
-                pub_key = crypto.getPublicKeyPem()
-            ))
+            dao.deleteMessagesForChat(contactId)
+            dao.deleteChat(contactId)
         }
     }
 
@@ -100,7 +106,7 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             _userName.value = newName
             dao.setSetting(Setting("user_name", newName))
-            client.sendPacket(Packet(
+             MessengerService.instance?.sendPacket(Packet(
                 action = "update_profile",
                 name = newName
             ))
@@ -114,9 +120,16 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun toggleLinkWarning(enabled: Boolean) {
+        viewModelScope.launch {
+            _showLinkWarning.value = enabled
+            dao.setSetting(Setting("link_warning", if (enabled) "True" else "False"))
+        }
+    }
+
     private fun observeIncomingPackets() {
         viewModelScope.launch {
-            client.incomingPackets.collect { packet ->
+            MessengerService.incomingPackets.collect { packet ->
                 when (packet.action) {
                     "incoming" -> handleIncomingPacket(packet)
                     "pub_key_response" -> handlePubKeyResponse(packet)
@@ -131,14 +144,16 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
         val type = data["type"]?.jsonPrimitive?.content ?: return
 
         when (type) {
-            "msg" -> {
+            "msg", "sticker" -> {
                 val chat = dao.getChat(from) ?: return
                 val contentEncrypted = data["content"]?.jsonPrimitive?.content ?: return
                 val fernetKey = chat.fernetKey ?: return
-                val msgType = data["msg_type"]?.jsonPrimitive?.content ?: "text"
+                val msgType = if (type == "sticker") "sticker" else (data["msg_type"]?.jsonPrimitive?.content ?: "text")
                 
                 try {
-                    val decrypted = crypto.decryptFernet(contentEncrypted, fernetKey)
+                    val decrypted = withContext(Dispatchers.Default) {
+                        crypto.decryptFernet(contentEncrypted, fernetKey)
+                    }
                     val msg = Message(
                         contactId = from,
                         senderId = from,
@@ -150,6 +165,44 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
                     dao.insertMessage(msg)
                 } catch (e: Exception) {
                     e.printStackTrace()
+                }
+            }
+            "chunk" -> {
+                val msgId = data["msg_id"]?.jsonPrimitive?.content ?: return
+                val index = data["index"]?.jsonPrimitive?.int ?: return
+                val total = data["total"]?.jsonPrimitive?.int ?: return
+                val chunkContent = data["content"]?.jsonPrimitive?.content ?: return
+                val msgType = data["msg_type"]?.jsonPrimitive?.content ?: "text"
+                val senderName = data["sender_name"]?.jsonPrimitive?.content ?: from
+
+                val chunks = incomingChunks.getOrPut(msgId) { mutableMapOf() }
+                chunks[index] = chunkContent
+                incomingChunksTotal[msgId] = total
+
+                if (chunks.size == total) {
+                    val fullEncrypted = (0 until total).joinToString("") { chunks[it]!! }
+                    incomingChunks.remove(msgId)
+                    incomingChunksTotal.remove(msgId)
+                    
+                    val chat = dao.getChat(from) ?: return
+                    val fernetKey = chat.fernetKey ?: return
+                    
+                    try {
+                        val decrypted = withContext(Dispatchers.Default) {
+                            crypto.decryptFernet(fullEncrypted, fernetKey)
+                        }
+                        val msg = Message(
+                            contactId = from,
+                            senderId = from,
+                            senderName = senderName,
+                            msgType = msgType,
+                            content = decrypted,
+                            timestamp = System.currentTimeMillis().toString()
+                        )
+                        dao.insertMessage(msg)
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
                 }
             }
             "handshake" -> {
@@ -167,7 +220,7 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
                     )
                     dao.insertChat(chat)
                     
-                    client.sendPacket(Packet(
+                    MessengerService.instance?.sendPacket(Packet(
                         action = "route",
                         to = from,
                         data = buildJsonObject {
@@ -194,8 +247,11 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
         val peerPubKey = packet.pub_key ?: return
         
         try {
-            val sessionKey = crypto.generateFernetKey()
-            val encryptedKey = crypto.encryptFernetKey(sessionKey, peerPubKey)
+            val (sessionKey, encryptedKey) = withContext(Dispatchers.Default) {
+                val sKey = crypto.generateFernetKey()
+                val eKey = crypto.encryptFernetKey(sKey, peerPubKey)
+                sKey to eKey
+            }
             
             val chat = Chat(
                 contactId = target,
@@ -206,7 +262,7 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
             )
             dao.insertChat(chat)
             
-            client.sendPacket(Packet(
+            MessengerService.instance?.sendPacket(Packet(
                 action = "route",
                 to = target,
                 data = buildJsonObject {
@@ -226,38 +282,153 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
             val fernetKey = chat.fernetKey ?: return@launch
             
             try {
-                val encrypted = crypto.encryptFernet(content, fernetKey)
-                val msgType = if (isImage) "image" else "text"
+                val encrypted = withContext(Dispatchers.Default) {
+                    crypto.encryptFernet(content, fernetKey)
+                }
                 
-                client.sendPacket(Packet(
-                    action = "route",
-                    to = contactId,
-                    data = buildJsonObject {
-                        put("type", "msg")
-                        put("msg_type", msgType)
-                        put("content", encrypted)
-                        put("sender_name", _userName.value)
+                val msgType = if (isImage) "image" else "text"
+                val maxChunkSize = 12000 // 12KB
+                
+                if (encrypted.length <= maxChunkSize) {
+                    val success = MessengerService.instance?.sendPacket(Packet(
+                        action = "route",
+                        to = contactId,
+                        data = buildJsonObject {
+                            put("type", "msg")
+                            put("msg_type", msgType)
+                            put("content", encrypted)
+                            put("sender_name", _userName.value)
+                        }
+                    )) ?: false
+                    if (success) {
+                        insertLocalMessage(contactId, content, msgType)
                     }
-                ))
-
-                val msg = Message(
-                    contactId = contactId,
-                    senderId = _myId.value,
-                    senderName = _userName.value,
-                    msgType = msgType,
-                    content = content,
-                    timestamp = System.currentTimeMillis().toString()
-                )
-                dao.insertMessage(msg)
+                } else {
+                    val msgId = UUID.randomUUID().toString()
+                    val chunks = encrypted.chunked(maxChunkSize)
+                    val total = chunks.size
+                    var allSuccess = true
+                    
+                    for ((index, chunkContent) in chunks.withIndex()) {
+                        val success = MessengerService.instance?.sendPacket(Packet(
+                            action = "route",
+                            to = contactId,
+                            data = buildJsonObject {
+                                put("type", "chunk")
+                                put("msg_id", msgId)
+                                put("index", index)
+                                put("total", total)
+                                put("msg_type", msgType)
+                                put("content", chunkContent)
+                                put("sender_name", _userName.value)
+                            }
+                        )) ?: false
+                        if (!success) {
+                            allSuccess = false
+                            break
+                        }
+                    }
+                    
+                    if (allSuccess) {
+                        insertLocalMessage(contactId, content, msgType)
+                    }
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
     }
 
+    @SuppressLint("MissingPermission")
+    fun sendSticker(contactId: String, stickerType: String) {
+        viewModelScope.launch {
+            val chat = dao.getChat(contactId) ?: return@launch
+            val fernetKey = chat.fernetKey ?: return@launch
+
+            val stickerContent = when (stickerType) {
+                "time" -> {
+                    val sdf = SimpleDateFormat("HH:mm", Locale.getDefault())
+                    "TIME:${sdf.format(Date())}"
+                }
+                "date" -> {
+                    val sdf = SimpleDateFormat("MMM dd", Locale.getDefault())
+                    "DATE:${sdf.format(Date())}"
+                }
+                "location" -> {
+                    try {
+                        val locationResult = fusedLocationClient.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, null).customAwait()
+                        if (locationResult != null) {
+                            val geocoder = Geocoder(getApplication(), Locale.getDefault())
+                            val addresses = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                suspendCancellableCoroutine { continuation ->
+                                    geocoder.getFromLocation(locationResult.latitude, locationResult.longitude, 1, object : Geocoder.GeocodeListener {
+                                        override fun onGeocode(addresses: MutableList<Address>) {
+                                            continuation.resume(addresses)
+                                        }
+                                        override fun onError(errorMessage: String?) {
+                                            continuation.resume(emptyList<Address>())
+                                        }
+                                    })
+                                }
+                            } else {
+                                withContext(Dispatchers.IO) {
+                                    @Suppress("DEPRECATION")
+                                    geocoder.getFromLocation(locationResult.latitude, locationResult.longitude, 1)
+                                }
+                            }
+                            val city = addresses?.firstOrNull()?.locality ?: "${locationResult.latitude.toString().take(5)}, ${locationResult.longitude.toString().take(5)}"
+                            "LOC:$city"
+                        } else "LOC:Unknown"
+                    } catch (e: Exception) { "LOC:Error" }
+                }
+                "battery" -> {
+                    val bm = getApplication<Application>().getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+                    val level = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                    "BATT:$level%"
+                }
+                "device" -> "DEV:${Build.MODEL}"
+                "greet" -> "GREET:Hello!"
+                "status" -> "STAT:Secure"
+                else -> return@launch
+            }
+
+            try {
+                val encrypted = withContext(Dispatchers.Default) {
+                    crypto.encryptFernet(stickerContent, fernetKey)
+                }
+                
+                val success = MessengerService.instance?.sendPacket(Packet(
+                    action = "route",
+                    to = contactId,
+                    data = buildJsonObject {
+                        put("type", "sticker")
+                        put("content", encrypted)
+                        put("sender_name", _userName.value)
+                    }
+                )) ?: false
+
+                if (success) {
+                    insertLocalMessage(contactId, stickerContent, "sticker")
+                }
+            } catch (e: Exception) { e.printStackTrace() }
+        }
+    }
+
+    private suspend fun insertLocalMessage(contactId: String, content: String, msgType: String) {
+        val msg = Message(
+            contactId = contactId,
+            senderId = _myId.value,
+            senderName = _userName.value,
+            msgType = msgType,
+            content = content,
+            timestamp = System.currentTimeMillis().toString()
+        )
+        dao.insertMessage(msg)
+    }
+
     fun addContact(targetId: String) {
         viewModelScope.launch {
-            client.sendPacket(Packet(
+            MessengerService.instance?.sendPacket(Packet(
                 action = "get_pub_key",
                 target = targetId.uppercase()
             ))
@@ -265,4 +436,14 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun getMessages(contactId: String): Flow<List<Message>> = dao.getMessages(contactId)
+
+    private suspend fun <T> Task<T>.customAwait(): T? = suspendCancellableCoroutine { continuation ->
+        addOnCompleteListener { task ->
+            if (task.isSuccessful) {
+                continuation.resume(task.result)
+            } else {
+                continuation.resume(null)
+            }
+        }
+    }
 }
